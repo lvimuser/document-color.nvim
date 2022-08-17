@@ -1,4 +1,4 @@
-local helpers = require('document-color.helpers')
+local helpers = require("document-color.helpers")
 
 local M = {}
 local NAMESPACE = vim.api.nvim_create_namespace("lsp_documentColor")
@@ -10,7 +10,8 @@ local OPTIONS = {
 
 local STATE = {
   ATTACHED_BUFFERS = {},
-  HIGHLIGHTS = {}
+  ATTACHED_CLIENTS = {},
+  HIGHLIGHTS = {},
 }
 
 function M.setup(options)
@@ -21,7 +22,9 @@ local function create_highlight(color)
   -- This will create something like "mb_d023d9"
   local cache_key = table.concat({ MODE_NAMES[OPTIONS.mode], color }, "_")
 
-  if STATE.HIGHLIGHTS[cache_key] then return STATE.HIGHLIGHTS[cache_key] end
+  if STATE.HIGHLIGHTS[cache_key] then
+    return STATE.HIGHLIGHTS[cache_key]
+  end
 
   -- This will create something like "lsp_documentColor_mb_d023d9", safe to start adding to neovim
   local highlight_name = table.concat({ "lsp_documentColor", MODE_NAMES[OPTIONS.mode], color }, "_")
@@ -37,7 +40,6 @@ local function create_highlight(color)
       string.format(
         "highlight %s guifg=%s guibg=#%s",
         highlight_name,
-        -- Choose the right foreground
         helpers.color_is_bright(r, g, b) and "Black" or "White",
         color
       )
@@ -49,55 +51,90 @@ local function create_highlight(color)
   return highlight_name
 end
 
+local function handler(results, bufnr)
+  -- TODO namespace/cleanup per client id
+  for id, r in pairs(results) do
+    if not STATE.ATTACHED_CLIENTS[id] then
+      goto continue
+    end
+
+    if r.error and #r.error > 0 then
+      vim.api.nvim_buf_clear_namespace(bufnr, NAMESPACE, 0, -1)
+      vim.notify_once("document color\n" .. vim.inspect(r.error), vim.log.levels.ERROR)
+      goto continue
+    end
+
+    local colors = r.result
+    if not colors then
+      goto continue
+    end
+
+    for _, info in pairs(colors) do
+      info.color = helpers.lsp_color_to_hex(info.color)
+
+      local range = info.range
+      -- Start highlighting range with color inside `bufnr`
+      vim.api.nvim_buf_add_highlight(
+        bufnr,
+        NAMESPACE,
+        create_highlight(info.color),
+        range.start.line,
+        range.start.character,
+        OPTIONS.mode == "single" and range.start.character + 1 or range["end"].character
+      )
+    end
+    ::continue::
+  end
+end
+
 --- Fetch and update highlights in the buffer
 function M.update_highlights(bufnr)
-  local params = { textDocument = vim.lsp.util.make_text_document_params() }
-
-  vim.lsp.buf_request(bufnr, "textDocument/documentColor", params, function(err, colors, _, _)
-    if err == nil and colors ~= nil then -- There is no error and we actually got something back
-      -- `_` is a TextDocumentIdentifier, not important
-      for _, color_info in pairs(colors) do
-        color_info.color = helpers.lsp_color_to_hex(color_info.color)
-
-        local range = color_info.range
-        -- Start highlighting range with color inside `bufnr`
-        vim.api.nvim_buf_add_highlight(
-          bufnr,
-          NAMESPACE,
-          create_highlight(color_info.color),
-          range.start.line,
-          range.start.character,
-          OPTIONS.mode == "single" and range.start.character + 1 or range["end"].character
-        )
-      end
-    end
+  local params = { textDocument = vim.lsp.util.make_text_document_params(bufnr) }
+  vim.lsp.buf_request_all(bufnr, "textDocument/documentColor", params, function(results)
+    handler(results, bufnr)
   end)
 end
 
-function M.buf_attach(bufnr)
+local debounced_fn
+local function set_debounced_fn(client)
+  if debounced_fn then
+    return debounced_fn
+  end
+
+  local delay = math.max(client.config.flags.debounce_text_changes or 0, 200)
+  local _, fn = require("document-color.defer").debounce(function(bufnr)
+    M.update_highlights(bufnr)
+  end, delay)
+
+  debounced_fn = fn
+end
+
+function M.buf_attach(bufnr, client)
+  set_debounced_fn(client)
   bufnr = helpers.get_bufnr(bufnr)
 
-  if STATE.ATTACHED_BUFFERS[bufnr] then return end -- We are already attached to this buffer, ignore
-  STATE.ATTACHED_BUFFERS[bufnr] = true -- Attach to this buffer
+  STATE.ATTACHED_CLIENTS[client.id] = true
+  if STATE.ATTACHED_BUFFERS[bufnr] then
+    return
+  end
+  STATE.ATTACHED_BUFFERS[bufnr] = true
 
   vim.api.nvim_buf_attach(bufnr, false, {
     on_lines = function()
       if not STATE.ATTACHED_BUFFERS[bufnr] then
         return true -- detach
       end
-      M.update_highlights(bufnr)
+      debounced_fn(bufnr)
     end,
     on_detach = function()
       STATE.ATTACHED_BUFFERS[bufnr] = nil
-    end
+    end,
   })
 
-  -- Wait for tailwind to load. 150 to be safe
-  -- After further investiation, tailwind seems to be sluggish for *every* new buffer!!
-  vim.wait(150, function () end)
-
-  -- Try again after some time
-  M.update_highlights(bufnr)
+  -- Wait for server to load.
+  vim.defer_fn(function()
+    M.update_highlights(bufnr)
+  end, 3000)
 end
 
 --- Can be used to detach from the buffer at any time
