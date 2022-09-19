@@ -69,20 +69,24 @@ local function handler(results, bufnr)
       goto continue
     end
 
+    vim.api.nvim_buf_clear_namespace(bufnr, NAMESPACE, 0, -1)
+
+    local cleared_line = {}
     for _, info in pairs(colors) do
       info.color = helpers.lsp_color_to_hex(info.color)
 
       local range = info.range
-      -- Start highlighting range with color inside `bufnr`
-      vim.api.nvim_buf_add_highlight(
-        bufnr,
-        NAMESPACE,
-        create_highlight(info.color),
-        range.start.line,
-        range.start.character,
-        OPTIONS.mode == "single" and range.start.character + 1 or range["end"].character
-      )
+      if not cleared_line[range.start.line] then
+        vim.api.nvim_buf_clear_namespace(bufnr, NAMESPACE, range.start.line, range.start.line + 1)
+        cleared_line[range.start.line] = true
+      end
+
+      vim.api.nvim_buf_set_extmark(bufnr, NAMESPACE, range.start.line, range.start.character, {
+        virt_text = { { "⯀", create_highlight(info.color) }, { " ", "Normal" } },
+        virt_text_pos = "inline",
+      })
     end
+
     ::continue::
   end
 end
